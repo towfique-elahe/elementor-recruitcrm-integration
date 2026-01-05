@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Elementor → Recruit CRM Integration
  * Description: Creates/updates Company, creates Contact, and creates Job in Recruit CRM from Elementor form submission.
- * Version: 2.1
+ * Version: 2.2
  * Author: Orbit570
  * Author URI: https://towfiqueelahe.com
  */
@@ -120,7 +120,8 @@ function erc_render_settings_page() {
         $debug_log = get_option( 'erc_debug_log', [] );
         if ( ! empty( $debug_log ) ) : 
             $total_logs = count( $debug_log );
-            $recent_logs = array_slice( $debug_log, -50 ); // Show last 50 entries
+            // $recent_logs = array_slice( $debug_log, -50 ); // Show last 50 entries
+            $recent_logs = $debug_log; // Show all entries
             
             // Summary stats
             $today_count = 0;
@@ -588,8 +589,8 @@ function erc_handle_elementor_submission( $record, $handler ) {
     // Create company if not found
     if ( ! $company_slug ) {
         $company_data = [
-            'company_name' => $company_name,  // Note: field name is company_name not name
-            'website'      => $fields['company_website'] ?? '',  // Note: field name is website not company_url
+            'company_name' => $company_name,
+            'website'      => $fields['company_website'] ?? '',
         ];
         
         erc_log( 'Creating company with data: ' . json_encode( $company_data ) );
@@ -657,7 +658,7 @@ function erc_handle_elementor_submission( $record, $handler ) {
                 'last_name'      => $fields['contact_last_name'] ?? '',
                 'email'          => $contact_email,
                 'contact_number' => $fields['contact_phone'] ?? '',
-                'company_slug'   => $company_slug,  // Use slug, not ID
+                'company_slug'   => $company_slug,
             ];
             
             erc_log( 'Creating contact with data: ' . json_encode( $contact_data ) );
@@ -685,15 +686,78 @@ function erc_handle_elementor_submission( $record, $handler ) {
 
     /**
      * =========================================================
-     * 3. JOB: CREATE
-     * According to docs: https://docs.recruitcrm.io/docs/rcrm-api-reference/14816ef96a63a-creates-a-new-job
-     * Required fields: name, company_slug, description
-     * Optional: contact_slug, location, custom_fields, number_of_openings, currency_id
+     * 3. JOB: CREATE - SIMPLIFIED VERSION (no custom fields first)
      * =========================================================
      */
     erc_log( 'Creating job posting...' );
     
-    // Prepare custom fields
+    // First, try without custom fields to see if it works
+    $job_payload = [
+        'name'               => $fields['job_title'] ?? 'New Position',
+        'company_slug'       => $company_slug,
+        'description'        => $fields['job_description'] ?? '',
+        'number_of_openings' => 1,
+        'currency_id'        => 1, // USD - check your Recruit CRM for correct ID
+    ];
+    
+    // Add optional fields if they exist
+    if ( ! empty( $fields['job_location'] ) ) {
+        $job_payload['location'] = substr( $fields['job_location'], 0, 255 ); // Limit length
+    }
+    
+    if ( ! empty( $contact_slug ) ) {
+        $job_payload['contact_slug'] = $contact_slug;
+    }
+    
+    erc_log( 'Job Payload (without custom fields): ' . json_encode( $job_payload ) );
+
+    $create_result = erc_api_request( '/jobs', 'POST', $job_payload );
+
+    if ( ! is_wp_error( $create_result ) && in_array( $create_result['code'], [ 200, 201 ] ) ) {
+        $job_slug = $create_result['body']['slug'] ?? null;
+        $job_id = $create_result['body']['id'] ?? null;
+        if ( $job_slug ) {
+            erc_log( 'Successfully created job posting with slug: ' . $job_slug . ' (ID: ' . $job_id . ')' );
+            
+            // Now try to add custom fields via PATCH if job was created
+            erc_add_job_custom_fields( $job_slug, $fields );
+        } else {
+            erc_log( 'Job created but slug not found in response' );
+        }
+    } else {
+        erc_log( 'ERROR: Job creation failed with code: ' . ( $create_result['code'] ?? 'Unknown' ) );
+        if ( isset( $create_result['body'] ) ) {
+            erc_log( 'Error details: ' . print_r( $create_result['body'], true ) );
+        }
+        
+        // Try alternative approach - check if description is required
+        if ( empty( $fields['job_description'] ) ) {
+            erc_log( 'Trying alternative: Job description might be required, adding placeholder...' );
+            $job_payload['description'] = 'Job description not provided';
+            
+            $create_result = erc_api_request( '/jobs', 'POST', $job_payload );
+            
+            if ( ! is_wp_error( $create_result ) && in_array( $create_result['code'], [ 200, 201 ] ) ) {
+                $job_slug = $create_result['body']['slug'] ?? null;
+                $job_id = $create_result['body']['id'] ?? null;
+                if ( $job_slug ) {
+                    erc_log( 'Successfully created job posting (with placeholder description) with slug: ' . $job_slug . ' (ID: ' . $job_id . ')' );
+                    erc_add_job_custom_fields( $job_slug, $fields );
+                }
+            }
+        }
+    }
+    
+    erc_log( '=== Elementor Form Submission Completed ===' );
+}
+
+/**
+ * Add custom fields to an existing job
+ */
+function erc_add_job_custom_fields( $job_slug, $fields ) {
+    erc_log( 'Attempting to add custom fields to job: ' . $job_slug );
+    
+    // Prepare custom fields - try different formats
     $custom_fields = [];
     
     // Map field names to custom field values
@@ -713,11 +777,15 @@ function erc_handle_elementor_submission( $record, $handler ) {
     ];
     
     foreach ( $field_mapping as $form_field => $custom_field_name ) {
-        if ( isset( $fields[ $form_field ] ) && ! empty( $fields[ $form_field ] ) ) {
+        if ( isset( $fields[ $form_field ] ) && ! empty( trim( $fields[ $form_field ] ) ) ) {
+            // Truncate very long values
+            $value = substr( trim( $fields[ $form_field ] ), 0, 500 );
+            
+            // Try format 1: array of custom_field objects
             $custom_fields[] = [
                 'custom_field' => [
                     'field_name' => $custom_field_name,
-                    'field_value' => $fields[ $form_field ],
+                    'field_value' => $value,
                 ]
             ];
         }
@@ -725,65 +793,71 @@ function erc_handle_elementor_submission( $record, $handler ) {
     
     // Add date fields if they exist
     if ( ! empty( $fields['desired_start_date'] ) ) {
-        $custom_fields[] = [
-            'custom_field' => [
-                'field_name' => 'Desired Start Date',
-                'field_value' => erc_format_date( $fields['desired_start_date'] ),
-            ]
-        ];
+        $date_value = erc_format_date( $fields['desired_start_date'] );
+        if ( ! empty( $date_value ) ) {
+            $custom_fields[] = [
+                'custom_field' => [
+                    'field_name' => 'Desired Start Date',
+                    'field_value' => $date_value,
+                ]
+            ];
+        }
     }
     
     if ( ! empty( $fields['application_deadline'] ) ) {
-        $custom_fields[] = [
-            'custom_field' => [
-                'field_name' => 'Application Deadline',
-                'field_value' => erc_format_date( $fields['application_deadline'] ),
-            ]
-        ];
-    }
-    
-    // Build job payload according to API docs
-    $job_payload = [
-        'name'                => $fields['job_title'] ?? 'New Position',
-        'company_slug'        => $company_slug,  // Use slug, not ID
-        'description'         => $fields['job_description'] ?? '',
-        'number_of_openings'  => 1,  // Default to 1 opening
-        'currency_id'         => 1,  // Default currency (check your Recruit CRM for correct ID)
-    ];
-    
-    // Add optional fields if they exist
-    if ( ! empty( $fields['job_location'] ) ) {
-        $job_payload['location'] = $fields['job_location'];
-    }
-    
-    if ( ! empty( $contact_slug ) ) {
-        $job_payload['contact_slug'] = $contact_slug;  // Use slug, not ID
-    }
-    
-    if ( ! empty( $custom_fields ) ) {
-        $job_payload['custom_fields'] = $custom_fields;
-    }
-    
-    erc_log( 'Job Payload: ' . json_encode( $job_payload ) );
-
-    $create_result = erc_api_request( '/jobs', 'POST', $job_payload );
-
-    if ( ! is_wp_error( $create_result ) && in_array( $create_result['code'], [ 200, 201 ] ) ) {
-        $job_slug = $create_result['body']['slug'] ?? null;
-        $job_id = $create_result['body']['id'] ?? null;
-        if ( $job_slug ) {
-            erc_log( 'Successfully created job posting with slug: ' . $job_slug . ' (ID: ' . $job_id . ')' );
-        } else {
-            erc_log( 'Job created but slug not found in response' );
+        $date_value = erc_format_date( $fields['application_deadline'] );
+        if ( ! empty( $date_value ) ) {
+            $custom_fields[] = [
+                'custom_field' => [
+                    'field_name' => 'Application Deadline',
+                    'field_value' => $date_value,
+                ]
+            ];
         }
+    }
+    
+    if ( empty( $custom_fields ) ) {
+        erc_log( 'No custom fields to add' );
+        return;
+    }
+    
+    erc_log( 'Custom fields to add: ' . json_encode( $custom_fields ) );
+    
+    // Try different approaches to add custom fields
+    
+    // Approach 1: PATCH with custom_fields array
+    $patch_data = [ 'custom_fields' => $custom_fields ];
+    $patch_result = erc_api_request( '/jobs/' . $job_slug, 'PATCH', $patch_data );
+    
+    if ( ! is_wp_error( $patch_result ) && in_array( $patch_result['code'], [ 200, 201 ] ) ) {
+        erc_log( 'Successfully added custom fields via PATCH' );
     } else {
-        erc_log( 'ERROR: Job creation failed with code: ' . ( $create_result['code'] ?? 'Unknown' ) );
-        if ( isset( $create_result['body'] ) ) {
-            erc_log( 'Error details: ' . print_r( $create_result['body'], true ) );
+        erc_log( 'Failed to add custom fields via PATCH. Code: ' . ( $patch_result['code'] ?? 'Unknown' ) );
+        
+        // Approach 2: Try PUT instead of PATCH
+        $put_result = erc_api_request( '/jobs/' . $job_slug, 'PUT', $patch_data );
+        if ( ! is_wp_error( $put_result ) && in_array( $put_result['code'], [ 200, 201 ] ) ) {
+            erc_log( 'Successfully added custom fields via PUT' );
+        } else {
+            erc_log( 'Failed to add custom fields via PUT. Code: ' . ( $put_result['code'] ?? 'Unknown' ) );
+            
+            // Approach 3: Try adding custom fields one by one
+            erc_log( 'Trying to add custom fields one by one...' );
+            foreach ( $custom_fields as $custom_field ) {
+                $single_field_data = [ 'custom_fields' => [ $custom_field ] ];
+                $single_result = erc_api_request( '/jobs/' . $job_slug, 'PATCH', $single_field_data );
+                
+                if ( ! is_wp_error( $single_result ) && in_array( $single_result['code'], [ 200, 201 ] ) ) {
+                    erc_log( 'Successfully added custom field: ' . $custom_field['custom_field']['field_name'] );
+                } else {
+                    erc_log( 'Failed to add custom field: ' . $custom_field['custom_field']['field_name'] . '. Code: ' . ( $single_result['code'] ?? 'Unknown' ) );
+                }
+                
+                // Small delay to avoid rate limiting
+                usleep( 100000 ); // 0.1 second
+            }
         }
     }
-    
-    erc_log( '=== Elementor Form Submission Completed ===' );
 }
 
 /**

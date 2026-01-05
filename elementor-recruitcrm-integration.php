@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Elementor → Recruit CRM Integration
  * Description: Creates/updates Company, creates Contact, and creates Job in Recruit CRM from Elementor form submission.
- * Version: 2.0
+ * Version: 2.1
  * Author: Orbit570
  * Author URI: https://towfiqueelahe.com
  */
@@ -450,7 +450,7 @@ function erc_api_request( $endpoint, $method = 'GET', $data = [] ) {
 
 /**
  * =========================================================
- * ELEMENTOR FORM HANDLER - UPDATED APPROACH
+ * ELEMENTOR FORM HANDLER - FIXED VERSION
  * =========================================================
  */
 add_action( 'elementor_pro/forms/process', 'erc_handle_elementor_submission', 10, 2 );
@@ -464,85 +464,32 @@ function erc_handle_elementor_submission( $record, $handler ) {
     $target_form_name = get_option( 'erc_form_name' );
     
     // If a target form name is set, we need to check if this is the right form
-    // But we need to be careful about calling get_form_settings()
-    
     if ( ! empty( $target_form_name ) ) {
-        // Try a safer approach - check for required fields first
-        // Get the form fields first
-        $fields = [];
-        foreach ( $record->get( 'fields' ) as $id => $field ) {
-            $clean_id = str_replace( 'form-field-', '', $id );
-            $fields[ $clean_id ] = sanitize_text_field( $field['value'] );
-        }
-        
-        // Check if this form has the required Recruit CRM fields
-        $has_required_fields = isset( $fields['company_name'] ) && 
-                              isset( $fields['job_title'] ) && 
-                              isset( $fields['contact_email'] );
-        
-        if ( ! $has_required_fields ) {
-            erc_log( 'Skipping form - does not have required Recruit CRM fields' );
-            return;
-        }
-        
-        // Now we know this is likely a Recruit CRM form, but we want to be sure
-        // Try to get form name safely - use reflection or try/catch
-        $current_form_name = '';
-        
-        // Method 1: Try with parameter (the correct way according to error)
+        // Try to get form name safely
         try {
             $current_form_name = $record->get_form_settings( 'form_name' );
             erc_log( 'Got form name via get_form_settings("form_name"): ' . $current_form_name );
-        } catch ( Exception $e ) {
-            erc_log( 'Error getting form name with parameter: ' . $e->getMessage() );
-        }
-        
-        // Method 2: Try to use reflection to call the method properly
-        if ( empty( $current_form_name ) ) {
-            try {
-                // Use reflection to inspect the method
-                $reflection = new ReflectionClass( $record );
-                $method = $reflection->getMethod( 'get_form_settings' );
-                $params = $method->getParameters();
-                
-                if ( count( $params ) > 0 ) {
-                    // The method expects parameters
-                    erc_log( 'get_form_settings() expects ' . count( $params ) . ' parameters' );
-                    
-                    // Try with empty string as parameter
-                    $current_form_name = $record->get_form_settings( '' );
-                    erc_log( 'Got form name with empty parameter: ' . $current_form_name );
-                }
-            } catch ( Exception $e ) {
-                erc_log( 'Reflection error: ' . $e->getMessage() );
-            }
-        }
-        
-        // If we still don't have a form name, log all available data
-        if ( empty( $current_form_name ) ) {
-            erc_log( 'Could not determine form name. Available data:' );
-            
-            // Try to get raw form data
-            try {
-                // Use get_data() method which might be available
-                if ( method_exists( $record, 'get_data' ) ) {
-                    $form_data = $record->get_data();
-                    erc_log( 'Form data via get_data(): ' . print_r( $form_data, true ) );
-                }
-            } catch ( Exception $e ) {
-                erc_log( 'Error getting form data: ' . $e->getMessage() );
-            }
-            
-            // Since we can't get the form name but we have required fields,
-            // we'll proceed but log a warning
-            erc_log( 'WARNING: Proceeding without form name verification' );
-        } else {
-            // We have a form name, check if it matches
-            erc_log( 'Current Form Name: ' . $current_form_name );
-            erc_log( 'Target Form Name: ' . $target_form_name );
             
             if ( $current_form_name !== $target_form_name ) {
                 erc_log( 'Skipping form - name does not match target' );
+                return;
+            }
+        } catch ( Exception $e ) {
+            erc_log( 'Error getting form name: ' . $e->getMessage() );
+            // If we can't verify form name, check for required fields
+            $fields = [];
+            foreach ( $record->get( 'fields' ) as $id => $field ) {
+                $clean_id = str_replace( 'form-field-', '', $id );
+                $fields[ $clean_id ] = sanitize_text_field( $field['value'] );
+            }
+            
+            // Check if this form has the required Recruit CRM fields
+            $has_required_fields = isset( $fields['company_name'] ) && 
+                                  isset( $fields['job_title'] ) && 
+                                  isset( $fields['contact_email'] );
+            
+            if ( ! $has_required_fields ) {
+                erc_log( 'Skipping form - does not have required Recruit CRM fields' );
                 return;
             }
         }
@@ -583,7 +530,7 @@ function erc_handle_elementor_submission( $record, $handler ) {
     erc_log( 'API Token found (first 10 chars): ' . substr( $api_token, 0, 10 ) . '...' );
 
     /**
-     * Normalize Elementor fields (if not already done)
+     * Normalize Elementor fields
      */
     if ( ! isset( $fields ) || empty( $fields ) ) {
         $fields = [];
@@ -608,6 +555,7 @@ function erc_handle_elementor_submission( $record, $handler ) {
     
     erc_log( 'Processing Company: ' . $company_name );
 
+    $company_slug = null;
     $company_id = null;
 
     // Search for existing company
@@ -617,16 +565,17 @@ function erc_handle_elementor_submission( $record, $handler ) {
         // Check if company exists in response
         if ( isset( $search_result['body']['data'] ) && is_array( $search_result['body']['data'] ) ) {
             foreach ( $search_result['body']['data'] as $company ) {
-                if ( isset( $company['name'] ) && strcasecmp( $company['name'], $company_name ) === 0 ) {
+                if ( isset( $company['company_name'] ) && strcasecmp( $company['company_name'], $company_name ) === 0 ) {
+                    $company_slug = $company['slug'] ?? null;
                     $company_id = $company['id'] ?? null;
-                    if ( $company_id ) {
-                        erc_log( 'Found existing company with ID: ' . $company_id );
+                    if ( $company_slug ) {
+                        erc_log( 'Found existing company with slug: ' . $company_slug . ' (ID: ' . $company_id . ')' );
                         break;
                     }
                 }
             }
             
-            if ( ! $company_id ) {
+            if ( ! $company_slug ) {
                 erc_log( 'No existing company found with exact name match' );
             }
         } else {
@@ -637,10 +586,10 @@ function erc_handle_elementor_submission( $record, $handler ) {
     }
 
     // Create company if not found
-    if ( ! $company_id ) {
+    if ( ! $company_slug ) {
         $company_data = [
-            'company_name'  => $company_name,
-            'website' => $fields['company_website'] ?? '',
+            'company_name' => $company_name,  // Note: field name is company_name not name
+            'website'      => $fields['company_website'] ?? '',  // Note: field name is website not company_url
         ];
         
         erc_log( 'Creating company with data: ' . json_encode( $company_data ) );
@@ -648,24 +597,17 @@ function erc_handle_elementor_submission( $record, $handler ) {
         $create_result = erc_api_request( '/companies', 'POST', $company_data );
         
         if ( ! is_wp_error( $create_result ) && in_array( $create_result['code'], [ 200, 201 ] ) ) {
+            $company_slug = $create_result['body']['slug'] ?? null;
             $company_id = $create_result['body']['id'] ?? null;
             
-            if ( $company_id ) {
-                erc_log( 'Successfully created company with ID: ' . $company_id );
+            if ( $company_slug ) {
+                erc_log( 'Successfully created company with slug: ' . $company_slug . ' (ID: ' . $company_id . ')' );
             } else {
-                // Try alternative location for ID
-                $company_id = $create_result['body']['data']['id'] ?? null;
-                if ( $company_id ) {
-                    erc_log( 'Successfully created company with ID (from data field): ' . $company_id );
-                } else {
-                    erc_log( 'ERROR: Company ID not found in response. Full response: ' . $create_result['raw'] );
-                    return;
-                }
+                erc_log( 'ERROR: Company slug not found in response. Full response: ' . $create_result['raw'] );
+                return;
             }
         } else {
             erc_log( 'ERROR: Failed to create company. Response code: ' . ( $create_result['code'] ?? 'Unknown' ) );
-            
-            // Try alternative field names
             if ( isset( $create_result['body'] ) && is_array( $create_result['body'] ) ) {
                 foreach ( $create_result['body'] as $key => $value ) {
                     if ( is_array( $value ) ) {
@@ -685,6 +627,7 @@ function erc_handle_elementor_submission( $record, $handler ) {
      * =========================================================
      */
     $contact_email = $fields['contact_email'] ?? '';
+    $contact_slug  = null;
     $contact_id    = null;
 
     if ( $contact_email ) {
@@ -697,9 +640,10 @@ function erc_handle_elementor_submission( $record, $handler ) {
             if ( isset( $search_result['body']['data'] ) && is_array( $search_result['body']['data'] ) ) {
                 foreach ( $search_result['body']['data'] as $contact ) {
                     if ( isset( $contact['email'] ) && strcasecmp( $contact['email'], $contact_email ) === 0 ) {
+                        $contact_slug = $contact['slug'] ?? null;
                         $contact_id = $contact['id'] ?? null;
-                        if ( $contact_id ) {
-                            erc_log( 'Found existing contact with ID: ' . $contact_id );
+                        if ( $contact_slug ) {
+                            erc_log( 'Found existing contact with slug: ' . $contact_slug . ' (ID: ' . $contact_id . ')' );
                             break;
                         }
                     }
@@ -707,13 +651,13 @@ function erc_handle_elementor_submission( $record, $handler ) {
             }
         }
 
-        if ( ! $contact_id ) {
+        if ( ! $contact_slug ) {
             $contact_data = [
-                'first_name' => $fields['contact_first_name'] ?? '',
-                'last_name'  => $fields['contact_last_name'] ?? '',
-                'email'      => $contact_email,
+                'first_name'     => $fields['contact_first_name'] ?? '',
+                'last_name'      => $fields['contact_last_name'] ?? '',
+                'email'          => $contact_email,
                 'contact_number' => $fields['contact_phone'] ?? '',
-                'company_slug'    => $company_id,
+                'company_slug'   => $company_slug,  // Use slug, not ID
             ];
             
             erc_log( 'Creating contact with data: ' . json_encode( $contact_data ) );
@@ -721,14 +665,18 @@ function erc_handle_elementor_submission( $record, $handler ) {
             $create_result = erc_api_request( '/contacts', 'POST', $contact_data );
             
             if ( ! is_wp_error( $create_result ) && in_array( $create_result['code'], [ 200, 201 ] ) ) {
-                $contact_id = $create_result['body']['id'] ?? $create_result['body']['data']['id'] ?? null;
-                if ( $contact_id ) {
-                    erc_log( 'Successfully created contact with ID: ' . $contact_id );
+                $contact_slug = $create_result['body']['slug'] ?? null;
+                $contact_id = $create_result['body']['id'] ?? null;
+                if ( $contact_slug ) {
+                    erc_log( 'Successfully created contact with slug: ' . $contact_slug . ' (ID: ' . $contact_id . ')' );
                 } else {
-                    erc_log( 'WARNING: Contact created but ID not found in response' );
+                    erc_log( 'WARNING: Contact created but slug not found in response' );
                 }
             } else {
                 erc_log( 'WARNING: Contact creation failed with code: ' . ( $create_result['code'] ?? 'Unknown' ) );
+                if ( isset( $create_result['body'] ) ) {
+                    erc_log( 'Error details: ' . print_r( $create_result['body'], true ) );
+                }
             }
         }
     } else {
@@ -738,6 +686,9 @@ function erc_handle_elementor_submission( $record, $handler ) {
     /**
      * =========================================================
      * 3. JOB: CREATE
+     * According to docs: https://docs.recruitcrm.io/docs/rcrm-api-reference/14816ef96a63a-creates-a-new-job
+     * Required fields: name, company_slug, description
+     * Optional: contact_slug, location, custom_fields, number_of_openings, currency_id
      * =========================================================
      */
     erc_log( 'Creating job posting...' );
@@ -791,27 +742,39 @@ function erc_handle_elementor_submission( $record, $handler ) {
         ];
     }
     
+    // Build job payload according to API docs
     $job_payload = [
-        'name'          => $fields['job_title'] ?? 'New Position',
-        'number_of_openings' => 1,
-        'company_slug'    => $company_id,
-        'contact_slug'    => $contact_id,
-        'currency_id'    => 1,
-        'description'   => $fields['job_description'] ?? '',
-        'location'      => $fields['job_location'] ?? '',
-        'custom_fields' => $custom_fields,
+        'name'                => $fields['job_title'] ?? 'New Position',
+        'company_slug'        => $company_slug,  // Use slug, not ID
+        'description'         => $fields['job_description'] ?? '',
+        'number_of_openings'  => 1,  // Default to 1 opening
+        'currency_id'         => 1,  // Default currency (check your Recruit CRM for correct ID)
     ];
+    
+    // Add optional fields if they exist
+    if ( ! empty( $fields['job_location'] ) ) {
+        $job_payload['location'] = $fields['job_location'];
+    }
+    
+    if ( ! empty( $contact_slug ) ) {
+        $job_payload['contact_slug'] = $contact_slug;  // Use slug, not ID
+    }
+    
+    if ( ! empty( $custom_fields ) ) {
+        $job_payload['custom_fields'] = $custom_fields;
+    }
     
     erc_log( 'Job Payload: ' . json_encode( $job_payload ) );
 
     $create_result = erc_api_request( '/jobs', 'POST', $job_payload );
 
     if ( ! is_wp_error( $create_result ) && in_array( $create_result['code'], [ 200, 201 ] ) ) {
-        $job_id = $create_result['body']['id'] ?? $create_result['body']['data']['id'] ?? null;
-        if ( $job_id ) {
-            erc_log( 'Successfully created job posting with ID: ' . $job_id );
+        $job_slug = $create_result['body']['slug'] ?? null;
+        $job_id = $create_result['body']['id'] ?? null;
+        if ( $job_slug ) {
+            erc_log( 'Successfully created job posting with slug: ' . $job_slug . ' (ID: ' . $job_id . ')' );
         } else {
-            erc_log( 'Job created but ID not found in response' );
+            erc_log( 'Job created but slug not found in response' );
         }
     } else {
         erc_log( 'ERROR: Job creation failed with code: ' . ( $create_result['code'] ?? 'Unknown' ) );

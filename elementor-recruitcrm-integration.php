@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Elementor → Recruit CRM Integration
  * Description: Creates/updates Company, creates Contact, and creates Job in Recruit CRM from Elementor form submission.
- * Version: 1.5
+ * Version: 1.9
  * Author: Orbit570
  * Author URI: https://towfiqueelahe.com
  */
@@ -84,14 +84,14 @@ function erc_render_settings_page() {
             </tr>
             <tr>
                 <th scope="row">
-                    <label for="erc_form_name">Elementor Form Name</label>
+                    <label for="erc_form_name">Target Form Name</label>
                 </th>
                 <td>
                     <input type="text" id="erc_form_name" name="erc_form_name"
                         value="<?php echo esc_attr( get_option( 'erc_form_name' ) ); ?>" class="regular-text" />
                     <p class="description">
-                        Enter the exact name of your Elementor form (e.g., "Recruitment Form"). Leave empty to process
-                        all forms.
+                        Enter "Recruitment Form" (exactly as shown) to target only that form. Leave empty to process all
+                        forms.
                     </p>
                 </td>
             </tr>
@@ -159,8 +159,83 @@ function erc_log( $message ) {
 }
 
 /**
+ * Make API request to Recruit CRM
+ */
+function erc_api_request( $endpoint, $method = 'GET', $data = [] ) {
+    $api_token = get_option( 'erc_recruitcrm_api_token' );
+    
+    if ( empty( $api_token ) ) {
+        return new WP_Error( 'no_token', 'API token missing' );
+    }
+    
+    $base_url = 'https://api.recruitcrm.io/v1';
+    $url = $base_url . $endpoint;
+    
+    $headers = [
+        'Authorization' => 'Bearer ' . $api_token,
+        'Content-Type'  => 'application/json',
+        'Accept'        => 'application/json',
+    ];
+    
+    $args = [
+        'headers' => $headers,
+        'timeout' => 30,
+    ];
+    
+    if ( in_array( $method, [ 'POST', 'PUT', 'PATCH' ] ) && ! empty( $data ) ) {
+        $args['body'] = json_encode( $data );
+    }
+    
+    if ( $method === 'GET' && ! empty( $data ) ) {
+        $url = add_query_arg( $data, $url );
+    }
+    
+    erc_log( "API Request: $method $url" );
+    if ( ! empty( $data ) ) {
+        erc_log( "Request Data: " . json_encode( $data ) );
+    }
+    
+    switch ( $method ) {
+        case 'POST':
+            $response = wp_remote_post( $url, $args );
+            break;
+        case 'PUT':
+            $args['method'] = 'PUT';
+            $response = wp_remote_request( $url, $args );
+            break;
+        case 'PATCH':
+            $args['method'] = 'PATCH';
+            $response = wp_remote_request( $url, $args );
+            break;
+        case 'DELETE':
+            $args['method'] = 'DELETE';
+            $response = wp_remote_request( $url, $args );
+            break;
+        default: // GET
+            $response = wp_remote_get( $url, $args );
+    }
+    
+    if ( is_wp_error( $response ) ) {
+        erc_log( "API Error: " . $response->get_error_message() );
+        return $response;
+    }
+    
+    $response_code = wp_remote_retrieve_response_code( $response );
+    $response_body = wp_remote_retrieve_body( $response );
+    
+    erc_log( "Response Code: $response_code" );
+    erc_log( "Response Body: $response_body" );
+    
+    return [
+        'code' => $response_code,
+        'body' => json_decode( $response_body, true ),
+        'raw'  => $response_body,
+    ];
+}
+
+/**
  * =========================================================
- * ELEMENTOR FORM HANDLER
+ * ELEMENTOR FORM HANDLER - UPDATED APPROACH
  * =========================================================
  */
 add_action( 'elementor_pro/forms/process', 'erc_handle_elementor_submission', 10, 2 );
@@ -169,25 +244,112 @@ function erc_handle_elementor_submission( $record, $handler ) {
     erc_log( '=== Elementor Form Submission Started ===' );
     
     /**
-     * Check if we should process this form
-     * Option 1: Process ALL forms (if no form name is set)
-     * Option 2: Process only specific form (if form name is set)
+     * Get the target form name from settings
      */
     $target_form_name = get_option( 'erc_form_name' );
     
+    // If a target form name is set, we need to check if this is the right form
+    // But we need to be careful about calling get_form_settings()
+    
     if ( ! empty( $target_form_name ) ) {
-        // Get form name safely
-        $form_settings = $record->get_form_settings();
-        $current_form_name = isset( $form_settings['form_name'] ) ? $form_settings['form_name'] : '';
+        // Try a safer approach - check for required fields first
+        // Get the form fields first
+        $fields = [];
+        foreach ( $record->get( 'fields' ) as $id => $field ) {
+            $clean_id = str_replace( 'form-field-', '', $id );
+            $fields[ $clean_id ] = sanitize_text_field( $field['value'] );
+        }
         
-        erc_log( 'Checking form: ' . $current_form_name . ' against target: ' . $target_form_name );
+        // Check if this form has the required Recruit CRM fields
+        $has_required_fields = isset( $fields['company_name'] ) && 
+                              isset( $fields['job_title'] ) && 
+                              isset( $fields['contact_email'] );
         
-        if ( $current_form_name !== $target_form_name ) {
-            erc_log( 'Skipping form - name does not match target' );
+        if ( ! $has_required_fields ) {
+            erc_log( 'Skipping form - does not have required Recruit CRM fields' );
             return;
         }
+        
+        // Now we know this is likely a Recruit CRM form, but we want to be sure
+        // Try to get form name safely - use reflection or try/catch
+        $current_form_name = '';
+        
+        // Method 1: Try with parameter (the correct way according to error)
+        try {
+            $current_form_name = $record->get_form_settings( 'form_name' );
+            erc_log( 'Got form name via get_form_settings("form_name"): ' . $current_form_name );
+        } catch ( Exception $e ) {
+            erc_log( 'Error getting form name with parameter: ' . $e->getMessage() );
+        }
+        
+        // Method 2: Try to use reflection to call the method properly
+        if ( empty( $current_form_name ) ) {
+            try {
+                // Use reflection to inspect the method
+                $reflection = new ReflectionClass( $record );
+                $method = $reflection->getMethod( 'get_form_settings' );
+                $params = $method->getParameters();
+                
+                if ( count( $params ) > 0 ) {
+                    // The method expects parameters
+                    erc_log( 'get_form_settings() expects ' . count( $params ) . ' parameters' );
+                    
+                    // Try with empty string as parameter
+                    $current_form_name = $record->get_form_settings( '' );
+                    erc_log( 'Got form name with empty parameter: ' . $current_form_name );
+                }
+            } catch ( Exception $e ) {
+                erc_log( 'Reflection error: ' . $e->getMessage() );
+            }
+        }
+        
+        // If we still don't have a form name, log all available data
+        if ( empty( $current_form_name ) ) {
+            erc_log( 'Could not determine form name. Available data:' );
+            
+            // Try to get raw form data
+            try {
+                // Use get_data() method which might be available
+                if ( method_exists( $record, 'get_data' ) ) {
+                    $form_data = $record->get_data();
+                    erc_log( 'Form data via get_data(): ' . print_r( $form_data, true ) );
+                }
+            } catch ( Exception $e ) {
+                erc_log( 'Error getting form data: ' . $e->getMessage() );
+            }
+            
+            // Since we can't get the form name but we have required fields,
+            // we'll proceed but log a warning
+            erc_log( 'WARNING: Proceeding without form name verification' );
+        } else {
+            // We have a form name, check if it matches
+            erc_log( 'Current Form Name: ' . $current_form_name );
+            erc_log( 'Target Form Name: ' . $target_form_name );
+            
+            if ( $current_form_name !== $target_form_name ) {
+                erc_log( 'Skipping form - name does not match target' );
+                return;
+            }
+        }
     } else {
-        erc_log( 'No target form name set - processing all forms' );
+        erc_log( 'No target form name set - processing all forms with required fields' );
+        
+        // Even without target, check for required fields
+        $fields = [];
+        foreach ( $record->get( 'fields' ) as $id => $field ) {
+            $clean_id = str_replace( 'form-field-', '', $id );
+            $fields[ $clean_id ] = sanitize_text_field( $field['value'] );
+        }
+        
+        // Check if this form has the required Recruit CRM fields
+        $has_required_fields = isset( $fields['company_name'] ) && 
+                              isset( $fields['job_title'] ) && 
+                              isset( $fields['contact_email'] );
+        
+        if ( ! $has_required_fields ) {
+            erc_log( 'Skipping form - does not have required Recruit CRM fields' );
+            return;
+        }
     }
     
     erc_log( 'Processing form for Recruit CRM integration...' );
@@ -206,23 +368,17 @@ function erc_handle_elementor_submission( $record, $handler ) {
     erc_log( 'API Token found (first 10 chars): ' . substr( $api_token, 0, 10 ) . '...' );
 
     /**
-     * Normalize Elementor fields
+     * Normalize Elementor fields (if not already done)
      */
-    $fields = [];
-    foreach ( $record->get( 'fields' ) as $id => $field ) {
-        $clean_id = str_replace( 'form-field-', '', $id );
-        $fields[ $clean_id ] = sanitize_text_field( $field['value'] );
+    if ( ! isset( $fields ) || empty( $fields ) ) {
+        $fields = [];
+        foreach ( $record->get( 'fields' ) as $id => $field ) {
+            $clean_id = str_replace( 'form-field-', '', $id );
+            $fields[ $clean_id ] = sanitize_text_field( $field['value'] );
+        }
     }
 
     erc_log( 'Form Fields Received: ' . print_r( $fields, true ) );
-
-    $base_url = 'https://api.recruitcrm.io/v1';
-
-    $headers = [
-        'Authorization' => 'Bearer ' . $api_token,
-        'Content-Type'  => 'application/json',
-        'Accept'        => 'application/json',
-    ];
 
     /**
      * =========================================================
@@ -240,71 +396,70 @@ function erc_handle_elementor_submission( $record, $handler ) {
     $company_id = null;
 
     // Search for existing company
-    $search_url = $base_url . '/companies/search?keyword=' . urlencode( $company_name );
-    erc_log( 'Searching company: ' . $search_url );
+    $search_result = erc_api_request( '/companies', 'GET', [ 'name' => $company_name ] );
     
-    $search_company = wp_remote_get( $search_url, [ 'headers' => $headers ] );
-
-    if ( is_wp_error( $search_company ) ) {
-        erc_log( 'ERROR searching company: ' . $search_company->get_error_message() );
-    } else {
-        $response_code = wp_remote_retrieve_response_code( $search_company );
-        $response_body = wp_remote_retrieve_body( $search_company );
-        erc_log( 'Company Search Response Code: ' . $response_code );
-        erc_log( 'Company Search Response Body: ' . $response_body );
-        
-        if ( $response_code === 200 ) {
-            $result = json_decode( $response_body, true );
-            $company_id = $result['data'][0]['id'] ?? null;
-            
-            if ( $company_id ) {
-                erc_log( 'Found existing company with ID: ' . $company_id );
-            } else {
-                erc_log( 'No existing company found, will create new one' );
+    if ( ! is_wp_error( $search_result ) && $search_result['code'] === 200 ) {
+        // Check if company exists in response
+        if ( isset( $search_result['body']['data'] ) && is_array( $search_result['body']['data'] ) ) {
+            foreach ( $search_result['body']['data'] as $company ) {
+                if ( isset( $company['name'] ) && strcasecmp( $company['name'], $company_name ) === 0 ) {
+                    $company_id = $company['id'] ?? null;
+                    if ( $company_id ) {
+                        erc_log( 'Found existing company with ID: ' . $company_id );
+                        break;
+                    }
+                }
             }
+            
+            if ( ! $company_id ) {
+                erc_log( 'No existing company found with exact name match' );
+            }
+        } else {
+            erc_log( 'No companies data in search response' );
         }
+    } else {
+        erc_log( 'Company search failed or returned error, will try to create new company' );
     }
 
     // Create company if not found
     if ( ! $company_id ) {
         $company_data = [
-            'name'    => $company_name,
-            'website' => $fields['company_website'] ?? '',
+            'name'        => $company_name,
+            'company_url' => $fields['company_website'] ?? '',
         ];
         
         erc_log( 'Creating company with data: ' . json_encode( $company_data ) );
         
-        $create_company = wp_remote_post(
-            $base_url . '/companies',
-            [
-                'headers' => $headers,
-                'body'    => json_encode( $company_data ),
-                'timeout' => 30, // Increase timeout
-            ]
-        );
-
-        if ( is_wp_error( $create_company ) ) {
-            erc_log( 'ERROR creating company: ' . $create_company->get_error_message() );
-            return;
-        }
+        $create_result = erc_api_request( '/companies', 'POST', $company_data );
         
-        $response_code = wp_remote_retrieve_response_code( $create_company );
-        $response_body = wp_remote_retrieve_body( $create_company );
-        erc_log( 'Company Create Response Code: ' . $response_code );
-        erc_log( 'Company Create Response Body: ' . $response_body );
-        
-        if ( $response_code === 201 || $response_code === 200 ) {
-            $company_response = json_decode( $response_body, true );
-            $company_id = $company_response['data']['id'] ?? null;
+        if ( ! is_wp_error( $create_result ) && in_array( $create_result['code'], [ 200, 201 ] ) ) {
+            $company_id = $create_result['body']['id'] ?? null;
             
             if ( $company_id ) {
                 erc_log( 'Successfully created company with ID: ' . $company_id );
             } else {
-                erc_log( 'ERROR: Company ID not found in response' );
-                return;
+                // Try alternative location for ID
+                $company_id = $create_result['body']['data']['id'] ?? null;
+                if ( $company_id ) {
+                    erc_log( 'Successfully created company with ID (from data field): ' . $company_id );
+                } else {
+                    erc_log( 'ERROR: Company ID not found in response. Full response: ' . $create_result['raw'] );
+                    return;
+                }
             }
         } else {
-            erc_log( 'ERROR: Failed to create company. Response code: ' . $response_code );
+            erc_log( 'ERROR: Failed to create company. Response code: ' . ( $create_result['code'] ?? 'Unknown' ) );
+            
+            // Try alternative field names
+            if ( isset( $create_result['body'] ) && is_array( $create_result['body'] ) ) {
+                foreach ( $create_result['body'] as $key => $value ) {
+                    if ( is_array( $value ) ) {
+                        erc_log( "Error detail - $key: " . print_r( $value, true ) );
+                    } else {
+                        erc_log( "Error detail - $key: $value" );
+                    }
+                }
+            }
             return;
         }
     }
@@ -320,25 +475,19 @@ function erc_handle_elementor_submission( $record, $handler ) {
     if ( $contact_email ) {
         erc_log( 'Processing Contact with email: ' . $contact_email );
         
-        $search_url = $base_url . '/contacts/search?email=' . urlencode( $contact_email );
-        erc_log( 'Searching contact: ' . $search_url );
+        // Search for contact by email
+        $search_result = erc_api_request( '/contacts', 'GET', [ 'email' => $contact_email ] );
         
-        $search_contact = wp_remote_get( $search_url, [ 'headers' => $headers ] );
-
-        if ( is_wp_error( $search_contact ) ) {
-            erc_log( 'ERROR searching contact: ' . $search_contact->get_error_message() );
-        } else {
-            $response_code = wp_remote_retrieve_response_code( $search_contact );
-            $response_body = wp_remote_retrieve_body( $search_contact );
-            erc_log( 'Contact Search Response Code: ' . $response_code );
-            erc_log( 'Contact Search Response Body: ' . $response_body );
-            
-            if ( $response_code === 200 ) {
-                $result = json_decode( $response_body, true );
-                $contact_id = $result['data'][0]['id'] ?? null;
-                
-                if ( $contact_id ) {
-                    erc_log( 'Found existing contact with ID: ' . $contact_id );
+        if ( ! is_wp_error( $search_result ) && $search_result['code'] === 200 ) {
+            if ( isset( $search_result['body']['data'] ) && is_array( $search_result['body']['data'] ) ) {
+                foreach ( $search_result['body']['data'] as $contact ) {
+                    if ( isset( $contact['email'] ) && strcasecmp( $contact['email'], $contact_email ) === 0 ) {
+                        $contact_id = $contact['id'] ?? null;
+                        if ( $contact_id ) {
+                            erc_log( 'Found existing contact with ID: ' . $contact_id );
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -348,34 +497,23 @@ function erc_handle_elementor_submission( $record, $handler ) {
                 'first_name' => $fields['contact_first_name'] ?? '',
                 'last_name'  => $fields['contact_last_name'] ?? '',
                 'email'      => $contact_email,
-                'phone'      => $fields['contact_phone'] ?? '',
-                'company_id' => $company_id,
+                'contact_number' => $fields['contact_phone'] ?? '',
+                'company'    => $company_id,
             ];
             
             erc_log( 'Creating contact with data: ' . json_encode( $contact_data ) );
             
-            $create_contact = wp_remote_post(
-                $base_url . '/contacts',
-                [
-                    'headers' => $headers,
-                    'body'    => json_encode( $contact_data ),
-                    'timeout' => 30,
-                ]
-            );
+            $create_result = erc_api_request( '/contacts', 'POST', $contact_data );
             
-            if ( is_wp_error( $create_contact ) ) {
-                erc_log( 'ERROR creating contact: ' . $create_contact->get_error_message() );
-            } else {
-                $response_code = wp_remote_retrieve_response_code( $create_contact );
-                $response_body = wp_remote_retrieve_body( $create_contact );
-                erc_log( 'Contact Create Response Code: ' . $response_code );
-                erc_log( 'Contact Create Response Body: ' . $response_body );
-                
-                if ( $response_code === 201 || $response_code === 200 ) {
-                    erc_log( 'Successfully created contact' );
+            if ( ! is_wp_error( $create_result ) && in_array( $create_result['code'], [ 200, 201 ] ) ) {
+                $contact_id = $create_result['body']['id'] ?? $create_result['body']['data']['id'] ?? null;
+                if ( $contact_id ) {
+                    erc_log( 'Successfully created contact with ID: ' . $contact_id );
                 } else {
-                    erc_log( 'WARNING: Contact creation returned non-success code: ' . $response_code );
+                    erc_log( 'WARNING: Contact created but ID not found in response' );
                 }
+            } else {
+                erc_log( 'WARNING: Contact creation failed with code: ' . ( $create_result['code'] ?? 'Unknown' ) );
             }
         }
     } else {
@@ -389,52 +527,78 @@ function erc_handle_elementor_submission( $record, $handler ) {
      */
     erc_log( 'Creating job posting...' );
     
+    // Prepare custom fields
+    $custom_fields = [];
+    
+    // Map field names to custom field values
+    $field_mapping = [
+        'job_department' => 'Department / Team',
+        'job_is_new' => 'Is this a new position?',
+        'job_is_temporary' => 'Is this a temporary position?',
+        'education_requirements' => 'Education Requirements',
+        'experience_years' => 'Years of Experience Required',
+        'certifications' => 'Professional Certifications',
+        'technical_skills' => 'Technical Skills',
+        'soft_skills' => 'Soft Skills',
+        'remote_option' => 'Remote Option',
+        'work_hours' => 'Work Hours',
+        'ideal_candidate_profile' => 'Ideal Candidate Profile',
+        'additional_information' => 'Additional Information',
+    ];
+    
+    foreach ( $field_mapping as $form_field => $custom_field_name ) {
+        if ( isset( $fields[ $form_field ] ) && ! empty( $fields[ $form_field ] ) ) {
+            $custom_fields[] = [
+                'custom_field' => [
+                    'field_name' => $custom_field_name,
+                    'field_value' => $fields[ $form_field ],
+                ]
+            ];
+        }
+    }
+    
+    // Add date fields if they exist
+    if ( ! empty( $fields['desired_start_date'] ) ) {
+        $custom_fields[] = [
+            'custom_field' => [
+                'field_name' => 'Desired Start Date',
+                'field_value' => erc_format_date( $fields['desired_start_date'] ),
+            ]
+        ];
+    }
+    
+    if ( ! empty( $fields['application_deadline'] ) ) {
+        $custom_fields[] = [
+            'custom_field' => [
+                'field_name' => 'Application Deadline',
+                'field_value' => erc_format_date( $fields['application_deadline'] ),
+            ]
+        ];
+    }
+    
     $job_payload = [
-        'title'       => $fields['job_title'] ?? 'New Position',
-        'company_id'  => $company_id,
-        'description' => $fields['job_description'] ?? '',
-        'location'    => $fields['job_location'] ?? '',
-        'custom_fields' => [
-            'Department / Team'            => $fields['job_department'] ?? '',
-            'Is this a new position?'       => $fields['job_is_new'] ?? '',
-            'Is this a temporary position?' => $fields['job_is_temporary'] ?? '',
-            'Education Requirements'        => $fields['education_requirements'] ?? '',
-            'Years of Experience Required'  => $fields['experience_years'] ?? '',
-            'Professional Certifications'   => $fields['certifications'] ?? '',
-            'Technical Skills'              => $fields['technical_skills'] ?? '',
-            'Soft Skills'                   => $fields['soft_skills'] ?? '',
-            'Remote Option'                 => $fields['remote_option'] ?? '',
-            'Work Hours'                    => $fields['work_hours'] ?? '',
-            'Ideal Candidate Profile'       => $fields['ideal_candidate_profile'] ?? '',
-            'Desired Start Date'            => erc_format_date( $fields['desired_start_date'] ?? '' ),
-            'Application Deadline'          => erc_format_date( $fields['application_deadline'] ?? '' ),
-            'Additional Information'        => $fields['additional_information'] ?? '',
-        ],
+        'name'          => $fields['job_title'] ?? 'New Position',
+        'company_id'    => $company_id,
+        'description'   => $fields['job_description'] ?? '',
+        'location'      => $fields['job_location'] ?? '',
+        'custom_fields' => $custom_fields,
     ];
     
     erc_log( 'Job Payload: ' . json_encode( $job_payload ) );
 
-    $create_job = wp_remote_post(
-        $base_url . '/jobs',
-        [
-            'headers' => $headers,
-            'body'    => json_encode( $job_payload ),
-            'timeout' => 30,
-        ]
-    );
+    $create_result = erc_api_request( '/jobs', 'POST', $job_payload );
 
-    if ( is_wp_error( $create_job ) ) {
-        erc_log( 'ERROR creating job: ' . $create_job->get_error_message() );
-    } else {
-        $response_code = wp_remote_retrieve_response_code( $create_job );
-        $response_body = wp_remote_retrieve_body( $create_job );
-        erc_log( 'Job Create Response Code: ' . $response_code );
-        erc_log( 'Job Create Response Body: ' . $response_body );
-        
-        if ( $response_code === 201 || $response_code === 200 ) {
-            erc_log( 'Successfully created job posting!' );
+    if ( ! is_wp_error( $create_result ) && in_array( $create_result['code'], [ 200, 201 ] ) ) {
+        $job_id = $create_result['body']['id'] ?? $create_result['body']['data']['id'] ?? null;
+        if ( $job_id ) {
+            erc_log( 'Successfully created job posting with ID: ' . $job_id );
         } else {
-            erc_log( 'ERROR: Job creation failed with code: ' . $response_code );
+            erc_log( 'Job created but ID not found in response' );
+        }
+    } else {
+        erc_log( 'ERROR: Job creation failed with code: ' . ( $create_result['code'] ?? 'Unknown' ) );
+        if ( isset( $create_result['body'] ) ) {
+            erc_log( 'Error details: ' . print_r( $create_result['body'], true ) );
         }
     }
     

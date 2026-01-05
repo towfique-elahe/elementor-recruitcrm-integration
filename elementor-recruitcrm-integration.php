@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Elementor → Recruit CRM Integration
  * Description: Creates/updates Company, creates Contact, and creates Job in Recruit CRM from Elementor form submission.
- * Version: 1.9
+ * Version: 2.0
  * Author: Orbit570
  * Author URI: https://towfiqueelahe.com
  */
@@ -113,25 +113,240 @@ function erc_render_settings_page() {
     </form>
 
     <?php if ( get_option( 'erc_debug_mode' ) ) : ?>
-    <div class="notice notice-info">
-        <h3>Recent Debug Logs</h3>
+    <div class="notice notice-info" style="margin-top: 20px;">
+        <h2 style="margin-top: 0;">Debug Logs</h2>
+
         <?php
         $debug_log = get_option( 'erc_debug_log', [] );
-        if ( ! empty( $debug_log ) ) {
-            echo '<pre>';
-            foreach ( array_slice( $debug_log, -10 ) as $log ) { // Show last 10 entries
-                echo esc_html( $log ) . "\n";
+        if ( ! empty( $debug_log ) ) : 
+            $total_logs = count( $debug_log );
+            $recent_logs = array_slice( $debug_log, -50 ); // Show last 50 entries
+            
+            // Summary stats
+            $today_count = 0;
+            $current_date = date( 'Y-m-d' );
+            foreach ( $debug_log as $log ) {
+                if ( strpos( $log, '[' . $current_date ) === 0 ) {
+                    $today_count++;
+                }
             }
-            echo '</pre>';
-        } else {
-            echo '<p>No debug logs yet.</p>';
+            ?>
+
+        <div style="margin-bottom: 15px; padding: 10px; background: #f0f0f1; border-left: 4px solid #2271b1;">
+            <strong>Log Summary:</strong>
+            <?php echo number_format( $total_logs ); ?> total entries |
+            <?php echo number_format( $today_count ); ?> today |
+            Showing last <?php echo number_format( count( $recent_logs ) ); ?> entries
+        </div>
+
+        <div style="margin-bottom: 15px;">
+            <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+                <button type="button" class="button" onclick="copyLogs()">Copy Logs</button>
+                <button type="button" class="button" onclick="toggleWordWrap()">Toggle Word Wrap</button>
+                <button type="button" class="button" onclick="filterLogs('ERROR')">Show Errors Only</button>
+                <button type="button" class="button" onclick="filterLogs('WARNING')">Show Warnings Only</button>
+                <button type="button" class="button" onclick="filterLogs('ALL')">Show All</button>
+            </div>
+
+            <div style="position: relative;">
+                <div style="position: absolute; top: 10px; right: 10px; z-index: 10;">
+                    <span id="log-count"
+                        style="background: #2271b1; color: white; padding: 3px 8px; border-radius: 3px; font-size: 12px;">
+                        <?php echo count( $recent_logs ); ?> entries
+                    </span>
+                </div>
+
+                <div id="log-container" style="
+                        background: #1d2327;
+                        color: #f0f0f0;
+                        padding: 15px;
+                        border-radius: 4px;
+                        font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace;
+                        font-size: 12px;
+                        line-height: 1.5;
+                        height: 500px;
+                        overflow-y: auto;
+                        overflow-x: auto;
+                        white-space: nowrap;
+                        margin-bottom: 15px;
+                        position: relative;
+                    ">
+                    <?php foreach ( $recent_logs as $index => $log ) : 
+                            $log_class = '';
+                            if ( strpos( $log, 'ERROR:' ) !== false ) {
+                                $log_class = 'log-error';
+                            } elseif ( strpos( $log, 'WARNING:' ) !== false ) {
+                                $log_class = 'log-warning';
+                            } elseif ( strpos( $log, '=== Elementor' ) !== false ) {
+                                $log_class = 'log-section';
+                            } elseif ( strpos( $log, 'API Request:' ) !== false ) {
+                                $log_class = 'log-api-request';
+                            } elseif ( strpos( $log, 'Response Code:' ) !== false ) {
+                                $log_class = 'log-api-response';
+                            }
+                        ?>
+                    <div class="log-entry <?php echo $log_class; ?>" data-index="<?php echo $index; ?>"
+                        style="margin-bottom: 4px; border-left: 3px solid transparent; padding-left: 5px;">
+                        <?php echo esc_html( $log ); ?>
+                    </div>
+                    <?php endforeach; ?>
+                </div>
+            </div>
+
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 10px;">
+                <div>
+                    <span style="display: inline-flex; align-items: center; margin-right: 15px;">
+                        <span
+                            style="display: inline-block; width: 12px; height: 12px; background: #dc3232; margin-right: 5px;"></span>
+                        <span style="font-size: 12px;">Errors</span>
+                    </span>
+                    <span style="display: inline-flex; align-items: center; margin-right: 15px;">
+                        <span
+                            style="display: inline-block; width: 12px; height: 12px; background: #f0b849; margin-right: 5px;"></span>
+                        <span style="font-size: 12px;">Warnings</span>
+                    </span>
+                    <span style="display: inline-flex; align-items: center; margin-right: 15px;">
+                        <span
+                            style="display: inline-block; width: 12px; height: 12px; background: #00a0d2; margin-right: 5px;"></span>
+                        <span style="font-size: 12px;">Section Start</span>
+                    </span>
+                    <span style="display: inline-flex; align-items: center;">
+                        <span
+                            style="display: inline-block; width: 12px; height: 12px; background: #46b450; margin-right: 5px;"></span>
+                        <span style="font-size: 12px;">API Calls</span>
+                    </span>
+                </div>
+
+                <div>
+                    <form method="post" style="display: inline;">
+                        <input type="hidden" name="erc_clear_logs" value="1">
+                        <?php wp_nonce_field( 'erc_clear_logs_action', 'erc_clear_logs_nonce' ); ?>
+                        <input type="submit" class="button button-primary" value="Clear All Logs"
+                            onclick="return confirm('Are you sure you want to clear all debug logs?');">
+                    </form>
+                    <button type="button" class="button" onclick="downloadLogs()" style="margin-left: 10px;">
+                        Download Logs
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <style>
+        .log-error {
+            border-left-color: #dc3232 !important;
+            color: #ff6b6b;
+            background: rgba(220, 50, 50, 0.1);
         }
-        ?>
-        <form method="post" style="margin-top: 10px;">
-            <input type="hidden" name="erc_clear_logs" value="1">
-            <?php wp_nonce_field( 'erc_clear_logs_action', 'erc_clear_logs_nonce' ); ?>
-            <input type="submit" class="button" value="Clear Debug Logs">
-        </form>
+
+        .log-warning {
+            border-left-color: #f0b849 !important;
+            color: #ffd166;
+            background: rgba(240, 184, 73, 0.1);
+        }
+
+        .log-section {
+            border-left-color: #00a0d2 !important;
+            color: #4ecdc4;
+            font-weight: bold;
+            background: rgba(0, 160, 210, 0.1);
+        }
+
+        .log-api-request {
+            border-left-color: #46b450 !important;
+            color: #88d498;
+            background: rgba(70, 180, 80, 0.1);
+        }
+
+        .log-api-response {
+            border-left-color: #7c3aed !important;
+            color: #c4b5fd;
+            background: rgba(124, 58, 237, 0.1);
+        }
+
+        .log-entry {
+            transition: all 0.2s ease;
+        }
+
+        .log-entry:hover {
+            background: rgba(255, 255, 255, 0.05) !important;
+        }
+        </style>
+
+        <script>
+        function copyLogs() {
+            const logContainer = document.getElementById('log-container');
+            const text = logContainer.innerText;
+            navigator.clipboard.writeText(text).then(() => {
+                alert('Logs copied to clipboard!');
+            });
+        }
+
+        function toggleWordWrap() {
+            const logContainer = document.getElementById('log-container');
+            logContainer.style.whiteSpace = logContainer.style.whiteSpace === 'nowrap' ? 'pre-wrap' : 'nowrap';
+        }
+
+        function filterLogs(type) {
+            const entries = document.querySelectorAll('.log-entry');
+            let visibleCount = 0;
+
+            entries.forEach(entry => {
+                let show = false;
+
+                switch (type) {
+                    case 'ERROR':
+                        show = entry.classList.contains('log-error');
+                        break;
+                    case 'WARNING':
+                        show = entry.classList.contains('log-warning');
+                        break;
+                    case 'ALL':
+                    default:
+                        show = true;
+                        break;
+                }
+
+                entry.style.display = show ? 'block' : 'none';
+                if (show) visibleCount++;
+            });
+
+            document.getElementById('log-count').textContent = visibleCount + ' entries';
+
+            // Scroll to top after filtering
+            document.getElementById('log-container').scrollTop = 0;
+        }
+
+        function downloadLogs() {
+            const logContainer = document.getElementById('log-container');
+            const text = logContainer.innerText;
+            const blob = new Blob([text], {
+                type: 'text/plain'
+            });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'recruit-crm-debug-' + new Date().toISOString().split('T')[0] + '.log';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        // Auto-scroll to bottom on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            const logContainer = document.getElementById('log-container');
+            if (logContainer) {
+                logContainer.scrollTop = logContainer.scrollHeight;
+            }
+        });
+        </script>
+
+        <?php else : ?>
+        <div style="text-align: center; padding: 30px; background: #f0f0f1; border-radius: 4px;">
+            <p style="font-size: 16px; color: #666; margin-bottom: 20px;">No debug logs yet.</p>
+            <p style="color: #999;">Submit an Elementor form to see debug logs here.</p>
+        </div>
+        <?php endif; ?>
     </div>
     <?php endif; ?>
 </div>
@@ -139,7 +354,7 @@ function erc_render_settings_page() {
     // Handle log clearing
     if ( isset( $_POST['erc_clear_logs'] ) && wp_verify_nonce( $_POST['erc_clear_logs_nonce'], 'erc_clear_logs_action' ) ) {
         update_option( 'erc_debug_log', [] );
-        echo '<div class="notice notice-success"><p>Debug logs cleared.</p></div>';
+        echo '<div class="notice notice-success is-dismissible"><p>Debug logs cleared successfully.</p></div>';
     }
 }
 
@@ -424,8 +639,8 @@ function erc_handle_elementor_submission( $record, $handler ) {
     // Create company if not found
     if ( ! $company_id ) {
         $company_data = [
-            'name'        => $company_name,
-            'company_url' => $fields['company_website'] ?? '',
+            'company_name'  => $company_name,
+            'website' => $fields['company_website'] ?? '',
         ];
         
         erc_log( 'Creating company with data: ' . json_encode( $company_data ) );
@@ -498,7 +713,7 @@ function erc_handle_elementor_submission( $record, $handler ) {
                 'last_name'  => $fields['contact_last_name'] ?? '',
                 'email'      => $contact_email,
                 'contact_number' => $fields['contact_phone'] ?? '',
-                'company'    => $company_id,
+                'company_slug'    => $company_id,
             ];
             
             erc_log( 'Creating contact with data: ' . json_encode( $contact_data ) );
@@ -578,7 +793,10 @@ function erc_handle_elementor_submission( $record, $handler ) {
     
     $job_payload = [
         'name'          => $fields['job_title'] ?? 'New Position',
-        'company_id'    => $company_id,
+        'number_of_openings' => 1,
+        'company_slug'    => $company_id,
+        'contact_slug'    => $contact_id,
+        'currency_id'    => 1,
         'description'   => $fields['job_description'] ?? '',
         'location'      => $fields['job_location'] ?? '',
         'custom_fields' => $custom_fields,

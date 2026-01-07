@@ -3,7 +3,7 @@
  * Plugin Name: Elementor → Recruit CRM Integration
  * Description: Creates/updates Company, creates Contact, and creates Job in Recruit CRM from Elementor form submission.
  * Version: 2.2
- * Author: Orbit570
+ * Author: Towfique Elahe
  * Author URI: https://towfiqueelahe.com
  */
 
